@@ -261,8 +261,8 @@ static void test_spectral_gap_path(void) {
     double gap = csf_flow_spectral_gap(&s);
     /* Path(4) spectral gap = 2(1 - cos(pi/4)) = 2 - sqrt(2) ≈ 0.5858 */
     ASSERT(gap > 0, "spectral gap positive");
-    ASSERT(gap < 10, "spectral gap bounded");
-    printf("    path(4) spectral gap = %.6f\n", gap);
+    ASSERT_FEQ(gap, 0.5858, 0.02, "path(4) spectral gap ≈ 0.586");
+    printf("    path(4) spectral gap = %.6f (expected ≈ 0.5858)\n", gap);
     csf_sheaf_free(&s);
 }
 
@@ -273,7 +273,8 @@ static void test_spectral_gap_cycle(void) {
     double gap = csf_flow_spectral_gap(&s);
     /* Cycle(4) spectral gap = 2(1 - cos(pi/2)) = 2 */
     ASSERT(gap > 0, "spectral gap positive");
-    printf("    cycle(4) spectral gap = %.6f\n", gap);
+    ASSERT_FEQ(gap, 2.0, 0.05, "cycle(4) spectral gap ≈ 2.0");
+    printf("    cycle(4) spectral gap = %.6f (expected ≈ 2.0)\n", gap);
     csf_sheaf_free(&s);
 }
 
@@ -284,7 +285,8 @@ static void test_spectral_gap_complete(void) {
     double gap = csf_flow_spectral_gap(&s);
     /* K4 spectral gap = 4 */
     ASSERT(gap > 0, "spectral gap positive");
-    printf("    K4 spectral gap = %.6f\n", gap);
+    ASSERT_FEQ(gap, 4.0, 0.05, "K4 spectral gap ≈ 4.0");
+    printf("    K4 spectral gap = %.6f (expected ≈ 4.0)\n", gap);
     csf_sheaf_free(&s);
 }
 
@@ -570,6 +572,47 @@ static void test_entropy_bounds(void) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ * 10. Double-free safety test
+ * ══════════════════════════════════════════════════════════════════════ */
+static void test_no_double_free(void) {
+    printf("test_no_double_free...\n");
+    /* Sheaf takes a deep copy of the graph, so freeing both should be safe */
+    CSFGraph g = csf_graph_path(4);
+    ConservationSheaf s = csf_sheaf_create(1, g);
+    /* Free the original graph — sheaf has its own copy */
+    csf_graph_free(&g);
+    /* Verify sheaf still has valid data */
+    ASSERT(s.graph.n == 4, "sheaf graph still valid after original freed");
+    ASSERT(s.laplacian_valid, "sheaf laplacian still valid");
+    /* Now free the sheaf — should not double-free */
+    csf_sheaf_free(&s);
+    ASSERT(1, "no crash from double-free");
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * 11. Evolving sheaf — EXPERIMENTAL (not a proven theorem)
+ * ══════════════════════════════════════════════════════════════════════ */
+static void test_evolving_sheaf_experimental(void) {
+    printf("test_evolving_sheaf_experimental (OPEN QUESTION)...\n");
+    CSFGraph g = csf_graph_cycle(4);
+    ConservationSheaf s = csf_sheaf_create(1, g);
+    double q[] = {3.0, 0.0, 1.0, 0.0};
+    FlowState fs = csf_flow_create(1, 4, q, 0.01);
+
+    SpectralEvolution ev = csf_track_spectral_gap_evolving(&s, &fs, 50);
+    printf("    evolving sheaf: gap[0]=%.3f, gap[last]=%.3f\n",
+           ev.spectral_gaps[0], ev.spectral_gaps[ev.n_steps - 1]);
+    printf("    theorem_holds=%s (EXPERIMENTAL — not a proven theorem)\n",
+           ev.theorem_holds ? "true" : "false");
+    /* We do NOT assert theorem_holds here — it's an open question */
+    ASSERT(ev.n_steps == 50, "evolving sheaf tracked all steps");
+
+    csf_flow_free(&fs);
+    csf_spectral_evolution_free(&ev);
+    csf_sheaf_free(&s);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  * MAIN
  * ══════════════════════════════════════════════════════════════════════ */
 int main(void) {
@@ -635,6 +678,14 @@ int main(void) {
     test_laplacian_psd();
     test_zero_vector_steady();
     test_entropy_bounds();
+
+    printf("\n── Double-free safety ──\n");
+    test_no_double_free();
+
+    printf("\n══════════════════════════════════════════════════════════\n");
+    printf("  Evolving Sheaf — EXPERIMENTAL (Open Question)\n");
+    printf("══════════════════════════════════════════════════════════\n\n");
+    test_evolving_sheaf_experimental();
 
     printf("\n══════════════════════════════════════════════════════════\n");
     printf("  Results: %d passed, %d failed, %d total\n",

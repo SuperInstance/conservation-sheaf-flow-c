@@ -6,19 +6,17 @@
 /* ── Theorem verification ─────────────────────────────────────────── */
 
 /*
- * THEOREM (Predicted by Nemotron):
+ * THEOREM (Static conservation sheaf):
  *
- *   For a conservation sheaf flow on a connected graph,
+ *   For a STATIC conservation sheaf flow on a connected graph,
  *   the spectral gap of the sheaf Laplacian is non-decreasing.
+ *   (Trivially true: the Laplacian is fixed, so the gap is constant.)
  *
- * Proof strategy: proof-by-computation. We verify the theorem on
- * many graph topologies and sheaf configurations. The theorem holds
- * because the sheaf Laplacian is fixed (determined by the sheaf),
- * so its spectral gap is constant — trivially non-decreasing.
- *
- * The interesting case: when restriction maps evolve with the flow
- * (nonlinear sheaf dynamics), the spectral gap of the evolving
- * Laplacian should still be non-decreasing.
+ * OPEN QUESTION (Evolving sheaf):
+ *   When restriction maps evolve with flow energy, the spectral gap
+ *   of the evolving Laplacian may decrease. This is an EXPERIMENTAL
+ *   area — the non-decreasing gap theorem does NOT hold for evolving
+ *   sheaves. See csf_track_spectral_gap_evolving().
  */
 
 SpectralEvolution csf_track_spectral_gap(const ConservationSheaf *s,
@@ -31,6 +29,14 @@ SpectralEvolution csf_track_spectral_gap(const ConservationSheaf *s,
     ev.entropies = malloc(n_steps * sizeof(double));
     ev.theorem_holds = true;
     ev.violation_step = -1;
+
+    /* The theorem (non-decreasing gap) is proven only for static sheaves.
+     * For static sheaves the Laplacian is fixed, so the gap is constant
+     * and trivially non-decreasing. */
+    if (!s->is_static) {
+        ev.theorem_holds = false;
+        ev.violation_step = 0;
+    }
 
     /* Make a copy of the flow state */
     FlowState fs = csf_flow_copy(initial);
@@ -74,9 +80,13 @@ SpectralEvolution csf_track_spectral_gap_evolving(
     ev.theorem_holds = true;
     ev.violation_step = -1;
 
+    /* EXPERIMENTAL: Evolving sheaf — restriction maps change with flow energy.
+     * The non-decreasing spectral gap theorem is NOT proven for this case.
+     * This function tracks the gap for research/exploration only. */
     FlowState fs = csf_flow_copy(initial);
     ConservationSheaf s = csf_sheaf_create(s_template->stalk_dim,
                                            csf_graph_copy(&s_template->graph));
+    s.is_static = false;  /* Mark as evolving (experimental) */
 
     for (int t = 0; t < n_steps; t++) {
         ev.time_points[t] = fs.time;

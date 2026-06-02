@@ -151,7 +151,11 @@ void csf_mat_vec(const CSFMatrix *M, const double *x, double *y) {
 ConservationSheaf csf_sheaf_create(int stalk_dim, CSFGraph graph) {
     ConservationSheaf s;
     s.stalk_dim = stalk_dim;
-    s.graph = graph;
+    /* Deep-copy the graph so the sheaf owns its own memory.
+     * This prevents double-free when both the sheaf and the caller's
+     * graph are freed independently. */
+    s.graph = csf_graph_copy(&graph);
+    s.is_static = true;
     s.restrictions = malloc(graph.m * sizeof(CSFMatrix));
     s.restrictions_T = malloc(graph.m * sizeof(CSFMatrix));
 
@@ -174,7 +178,9 @@ ConservationSheaf csf_sheaf_create_with_restrictions(
     int stalk_dim, CSFGraph graph, const CSFMatrix *restrictions) {
     ConservationSheaf s;
     s.stalk_dim = stalk_dim;
-    s.graph = graph;
+    /* Deep-copy the graph so the sheaf owns its own memory. */
+    s.graph = csf_graph_copy(&graph);
+    s.is_static = true;
     s.restrictions = malloc(graph.m * sizeof(CSFMatrix));
     s.restrictions_T = malloc(graph.m * sizeof(CSFMatrix));
 
@@ -298,57 +304,62 @@ bool csf_global_conservation_check(const ConservationSheaf *s,
 
 /* ── Eigenvalue computation ───────────────────────────────────────── */
 
-double csf_eigenvalue_min(const CSFMatrix *M, int iterations, double tol) {
-    int n = M->n;
-    double *v = malloc(n * sizeof(double));
-    double *w = malloc(n * sizeof(double));
-
-    /* Initialize with random-ish vector */
-    for (int i = 0; i < n; i++) v[i] = 1.0 / (i + 1);
-
-    /* Power iteration for largest eigenvalue */
-    for (int it = 0; it < iterations; it++) {
-        csf_mat_vec(M, v, w);
-        double norm = 0;
-        for (int i = 0; i < n; i++) norm += w[i] * w[i];
-        norm = sqrt(norm);
-        if (norm < 1e-15) break;
-        for (int i = 0; i < n; i++) v[i] = w[i] / norm;
+/* Solve M * x = b via Gaussian elimination (for small dense matrices).
+   Overwrites b with solution x. M is destroyed. */
+static void csf_solve_system(int n, double *M, double *b) {
+    /* Forward elimination with partial pivoting */
+    for (int col = 0; col < n; col++) {
+        /* Find pivot */
+        int pivot = col;
+        double max_val = fabs(M[col * n + col]);
+        for (int row = col + 1; row < n; row++) {
+            double v = fabs(M[row * n + col]);
+            if (v > max_val) { max_val = v; pivot = row; }
+        }
+        /* Swap rows */
+        if (pivot != col) {
+            for (int j = 0; j < n; j++) {
+                double tmp = M[col * n + j];
+                M[col * n + j] = M[pivot * n + j];
+                M[pivot * n + j] = tmp;
+            }
+            double tmp = b[col]; b[col] = b[pivot]; b[pivot] = tmp;
+        }
+        if (fabs(M[col * n + col]) < 1e-15) {
+            /* Singular — zero out to skip */
+            M[col * n + col] = 1e-15;
+        }
+        /* Eliminate below */
+        for (int row = col + 1; row < n; row++) {
+            double factor = M[row * n + col] / M[col * n + col];
+            for (int j = col + 1; j < n; j++)
+                M[row * n + j] -= factor * M[col * n + j];
+            M[row * n + col] = 0;
+            b[row] -= factor * b[col];
+        }
     }
-    /* Rayleigh quotient for largest */
-    csf_mat_vec(M, v, w);
-    double rq = 0;
-    for (int i = 0; i < n; i++) rq += v[i] * w[i];
-
-    free(v);
-    free(w);
-    return rq;
+    /* Back substitution */
+    for (int row = n - 1; row >= 0; row--) {
+        for (int j = row + 1; j < n; j++)
+            b[row] -= M[row * n + j] * b[j];
+        b[row] /= M[row * n + row];
+    }
 }
 
-double *csf_eigenvalues_k_smallest(const CSFMatrix *M, int k,
-                                   int iterations, double tol) {
+double csf_eigenvalue_min(const CSFMatrix *M, int iterations, double tol) {
+    /* For PSD matrices: find smallest eigenvalue via inverse iteration.
+       Inverse iteration on A converges to the eigenvector for the eigenvalue
+       closest to 0, which for a PSD matrix is λ_min = 0.
+       To find λ_1 (smallest non-zero), we project out the null space first. */
     int n = M->n;
-    double *eigs = malloc(k * sizeof(double));
-
-    /* We use inverse iteration / shifted approach.
-       For PSD matrix: eigenvalues are 0 = lambda_0 <= lambda_1 <= ...
-       We compute the Rayleigh quotient of iterates.
-       Strategy: shift by (I - alpha*L) and power iterate to find smallest. */
-
-    /* Use the fact that for sheaf Laplacian, lambda_0 = 0.
-       We find lambda_1 (spectral gap) via:
-       - Project out the constant eigenvector
-       - Power iterate on L to find largest non-zero eigenvalue
-       - Use that as upper bound, then binary search or just return Rayleigh quotient */
-
     double *v = malloc(n * sizeof(double));
     double *w = malloc(n * sizeof(double));
-    double *u = malloc(n * sizeof(double));
+    double *Acopy = malloc((size_t)n * n * sizeof(double));
 
-    /* Start with a non-constant vector */
+    /* Initialize with non-constant vector */
     for (int i = 0; i < n; i++) v[i] = (i % 2 == 0) ? 1.0 : -1.0;
 
-    /* Project out constant (kernel of Laplacian) */
+    /* Project out constant (kernel of graph Laplacian) */
     double mean = 0;
     for (int i = 0; i < n; i++) mean += v[i];
     mean /= n;
@@ -361,9 +372,19 @@ double *csf_eigenvalues_k_smallest(const CSFMatrix *M, int k,
     if (norm > 1e-15)
         for (int i = 0; i < n; i++) v[i] /= norm;
 
-    /* Power iterate on L */
+    /* Inverse iteration: solve (A + shift*I) * w = v, then v = w/||w||
+       The shift ensures the matrix is non-singular and finds eigenvalue near 0.
+       Since we projected out the kernel, this converges to λ_1. */
+    double shift = 1e-6;
     for (int it = 0; it < iterations; it++) {
-        csf_mat_vec(M, v, w);
+        /* Copy shifted matrix */
+        for (int i = 0; i < n * n; i++) Acopy[i] = M->data[i];
+        for (int i = 0; i < n; i++) Acopy[i * n + i] += shift;
+
+        /* Solve (A + shift*I) * w = v */
+        memcpy(w, v, n * sizeof(double));
+        csf_solve_system(n, Acopy, w);
+
         /* Project out constant again */
         mean = 0;
         for (int i = 0; i < n; i++) mean += w[i];
@@ -377,40 +398,128 @@ double *csf_eigenvalues_k_smallest(const CSFMatrix *M, int k,
         for (int i = 0; i < n; i++) v[i] = w[i] / norm;
     }
 
-    /* Rayleigh quotient = lambda_1 (spectral gap) */
+    /* Rayleigh quotient: v^T A v = eigenvalue */
     csf_mat_vec(M, v, w);
     double rq = 0;
     for (int i = 0; i < n; i++) rq += v[i] * w[i];
 
-    eigs[0] = 0.0; /* lambda_0 */
-    if (k > 1) eigs[1] = rq;
-    /* For k > 2, use deflation (simplified) */
-    if (k > 2) {
-        for (int eig = 2; eig < k; eig++) {
-            /* Deflate: subtract v*v^T component */
-            for (int i = 0; i < n; i++) u[i] = (i % (eig + 1) == 0) ? 1.0 : -0.5;
+    free(v); free(w); free(Acopy);
+    return rq;
+}
 
-            for (int def = 0; def < eig; def++) {
-                /* Reconstruct previous eigenvectors approximately */
-            }
+double *csf_eigenvalues_k_smallest(const CSFMatrix *M, int k,
+                                   int iterations, double tol) {
+    int n = M->n;
+    double *eigs = malloc(k * sizeof(double));
+    double *v = malloc(n * sizeof(double));
+    double *w = malloc(n * sizeof(double));
+    double *Acopy = malloc((size_t)n * n * sizeof(double));
 
-            for (int it = 0; it < iterations; it++) {
-                /* Simple power iteration */
-                csf_mat_vec(M, u, w);
-                norm = 0;
-                for (int i = 0; i < n; i++) norm += w[i] * w[i];
-                norm = sqrt(norm);
-                if (norm < 1e-15) break;
-                for (int i = 0; i < n; i++) u[i] = w[i] / norm;
-            }
-            csf_mat_vec(M, u, w);
-            rq = 0;
-            for (int i = 0; i < n; i++) rq += u[i] * w[i];
-            eigs[eig] = rq;
-        }
+    /* lambda_0 = 0 for connected graph Laplacian */
+    eigs[0] = 0.0;
+
+    if (k <= 1) { free(v); free(w); free(Acopy); return eigs; }
+
+    /* Find λ_1 via inverse iteration with kernel projected out */
+    for (int i = 0; i < n; i++) v[i] = (i % 2 == 0) ? 1.0 : -1.0;
+
+    /* Project out constant */
+    double mean = 0;
+    for (int i = 0; i < n; i++) mean += v[i];
+    mean /= n;
+    for (int i = 0; i < n; i++) v[i] -= mean;
+    double norm = 0;
+    for (int i = 0; i < n; i++) norm += v[i] * v[i];
+    norm = sqrt(norm);
+    if (norm > 1e-15)
+        for (int i = 0; i < n; i++) v[i] /= norm;
+
+    double shift = 1e-6;
+    for (int it = 0; it < iterations; it++) {
+        for (int i = 0; i < n * n; i++) Acopy[i] = M->data[i];
+        for (int i = 0; i < n; i++) Acopy[i * n + i] += shift;
+        memcpy(w, v, n * sizeof(double));
+        csf_solve_system(n, Acopy, w);
+        mean = 0;
+        for (int i = 0; i < n; i++) mean += w[i];
+        mean /= n;
+        for (int i = 0; i < n; i++) w[i] -= mean;
+        norm = 0;
+        for (int i = 0; i < n; i++) norm += w[i] * w[i];
+        norm = sqrt(norm);
+        if (norm < 1e-15) break;
+        for (int i = 0; i < n; i++) v[i] = w[i] / norm;
     }
 
-    free(v); free(w); free(u);
+    csf_mat_vec(M, v, w);
+    double rq = 0;
+    for (int i = 0; i < n; i++) rq += v[i] * w[i];
+    eigs[1] = rq;
+
+    /* For k > 2, use deflation with inverse iteration */
+    /* Store found eigenvectors for deflation */
+    double *evecs = NULL;
+    if (k > 2) {
+        evecs = malloc((size_t)(k - 1) * n * sizeof(double));
+        memcpy(evecs, v, n * sizeof(double));  /* first non-trivial eigenvector */
+    }
+
+    for (int eig = 2; eig < k; eig++) {
+        /* Initialize with diverse vector */
+        for (int i = 0; i < n; i++) v[i] = sin((double)(i * (eig + 2)));
+
+        /* Project out all previously found eigenvectors and the constant */
+        for (int def = 0; def < eig - 1; def++) {
+            double dot = 0;
+            for (int i = 0; i < n; i++) dot += v[i] * evecs[def * n + i];
+            for (int i = 0; i < n; i++) v[i] -= dot * evecs[def * n + i];
+        }
+        /* Project out constant */
+        mean = 0;
+        for (int i = 0; i < n; i++) mean += v[i];
+        mean /= n;
+        for (int i = 0; i < n; i++) v[i] -= mean;
+
+        norm = 0;
+        for (int i = 0; i < n; i++) norm += v[i] * v[i];
+        norm = sqrt(norm);
+        if (norm > 1e-15)
+            for (int i = 0; i < n; i++) v[i] /= norm;
+
+        /* Shifted inverse iteration to find next eigenvalue */
+        double target_shift = eigs[eig - 1] + 1e-6;
+        for (int it = 0; it < iterations; it++) {
+            for (int i = 0; i < n * n; i++) Acopy[i] = M->data[i];
+            for (int i = 0; i < n; i++) Acopy[i * n + i] -= target_shift;
+            memcpy(w, v, n * sizeof(double));
+            csf_solve_system(n, Acopy, w);
+
+            /* Project out all previous eigenvectors + constant */
+            for (int def = 0; def < eig - 1; def++) {
+                double dot = 0;
+                for (int i = 0; i < n; i++) dot += w[i] * evecs[def * n + i];
+                for (int i = 0; i < n; i++) w[i] -= dot * evecs[def * n + i];
+            }
+            mean = 0;
+            for (int i = 0; i < n; i++) mean += w[i];
+            mean /= n;
+            for (int i = 0; i < n; i++) w[i] -= mean;
+
+            norm = 0;
+            for (int i = 0; i < n; i++) norm += w[i] * w[i];
+            norm = sqrt(norm);
+            if (norm < 1e-15) break;
+            for (int i = 0; i < n; i++) v[i] = w[i] / norm;
+        }
+
+        csf_mat_vec(M, v, w);
+        rq = 0;
+        for (int i = 0; i < n; i++) rq += v[i] * w[i];
+        eigs[eig] = rq;
+        memcpy(evecs + (eig - 1) * n, v, n * sizeof(double));
+    }
+
+    free(v); free(w); free(Acopy); free(evecs);
     return eigs;
 }
 

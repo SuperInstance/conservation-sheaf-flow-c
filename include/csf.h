@@ -77,6 +77,11 @@ typedef struct {
     /* sheaf Laplacian: n*stalk_dim x n*stalk_dim */
     CSFMatrix laplacian;
     bool      laplacian_valid;
+
+    /* Whether the sheaf is static (restriction maps fixed).
+     * Only static sheaves satisfy the non-decreasing spectral gap theorem.
+     * Evolving sheaves (restriction maps change with flow) are EXPERIMENTAL. */
+    bool      is_static;
 } ConservationSheaf;
 
 /* Construct a conservation sheaf with identity restriction maps */
@@ -157,6 +162,12 @@ typedef struct {
 SpectralEvolution csf_track_spectral_gap(const ConservationSheaf *s,
                                          const FlowState *initial,
                                          int n_steps);
+
+/* Track spectral gap for evolving sheaf (EXPERIMENTAL — not a proven theorem) */
+SpectralEvolution csf_track_spectral_gap_evolving(
+    const ConservationSheaf *s_template,
+    const FlowState *initial,
+    int n_steps);
 
 /* Verify the theorem: spectral gap is non-decreasing during flow */
 bool csf_verify_non_decreasing_gap(const SpectralEvolution *ev);
